@@ -16,11 +16,8 @@ test_data = pd.read_csv('test.csv')
 
 # Data 추출
 train_target = train_data['SalePrice']
-
 train_data = train_data.drop(columns=['Id','SalePrice'])
-
 test_data = test_data.drop(columns=['Id'])
-
 train_target = np.log(train_target)
 
 # train data와 test data가 같은 더미변수를 가지기 위해 합침
@@ -60,17 +57,43 @@ class CustomDataset(Dataset):
 dataset = CustomDataset(X_train, y_train)
 val_dataset = CustomDataset(X_valid, y_valid)
 
-dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=128, shuffle=True)
+#%%
+def get_data(train_ds, valid_ds, bs):
+  return (
+    DataLoader(train_ds, batch_size=bs, shuffle=True),
+    DataLoader(valid_ds, batch_size=bs*2),      
+  )
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#%%
+device = 'cuda' if torch.cuda.is_available() else 'cpu'    
+
+def preprocess(x, y):
+    return x.to(device), y.to(device)
+
+class WrappedDataLoader:
+    def __init__(self, dl, func):
+        self.dl = dl
+        self.func = func
+
+    def __len__(self):
+        return len(self.dl)
+
+    def __iter__(self):
+        batches = iter(self.dl)
+        for b in batches:
+            yield (self.func(*b))
+
+dataloader, val_dataloader = get_data(dataset, val_dataset, 256)
+dataloader = WrappedDataLoader(dataloader, preprocess)
+val_dataloader = WrappedDataLoader(val_dataloader, preprocess)
+
 #%%
 # 학습 모델
 class Net(torch.nn.Module):
     def __init__(self, layer_value):
         super(Net,self).__init__()
         self.layer = nn.ModuleList()
-        for i, value in enumerate(layer_value[:-1]) :
+        for i, _ in enumerate(layer_value[:-1]) :
             self.layer.append(nn.Linear(layer_value[i],layer_value[i+1]))
             nn.init.xavier_uniform_(self.layer[i].weight)
 
@@ -85,158 +108,72 @@ class Net(torch.nn.Module):
       output = torch.relu(self.layer[-1](out))
 
       return output
-  
+#%%
 # model과 optimizer 선언
-layer_value = [288,1024,1024,1]
-model = Net(layer_value).to(device)
+def get_model(layer_value):
+  model = Net(layer_value)
+  optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+  scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+  return model, optimizer, scheduler
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-#scheduler
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
-
+#%%
 # log에 0이 들어가지 않게 조정 후 loss 반환
 def MSLE_loss(pred, target):
     log_pred = torch.log(pred + 0.1)
     loss = nn.MSELoss()(log_pred, target)
     return loss
+  
 #%%
-nb_epochs = 500
-best_loss = 10 ** 9 # 매우 큰 값으로 초기값 가정
-patience_limit = 3 # 몇 번의 epoch까지 지켜볼지를 결정
-patience_check = 0 # 현재 몇 epoch 연속으로 loss 개선이 안되는지를 기록
-val = []
-
-for epoch in range(nb_epochs + 1):
-  sum_loss = 0
-  model.train()
-  for batch_idx, samples in enumerate(dataloader):
-
-
-    x_train, y_train = samples
-    x_train = x_train.to(device)
-    y_train = y_train.to(device)
-
-    # prediction 계산
-    prediction = model(x_train)
-
-    # loss 계산
-    loss = MSLE_loss(prediction, y_train)
-
-    # parameter 조정
-    optimizer.zero_grad()
+def loss_batch(model, loss_func, xb, yb, opt=None):
+  loss = loss_func(model(xb), yb)
+  
+  if opt is not None:
+    opt.zero_grad()
     loss.backward()
-    optimizer.step()
+    opt.step()
+    
+  return loss.item(), len(xb)
 
-    sum_loss += loss.item()
+#%%
+def fit(model, loss_func, opt, scheduler, train_dl, valid_dl, nb_epochs):
+  best_loss = 10 ** 9 # 매우 큰 값으로 초기값 가정
+  patience_limit = 3 # 몇 번의 epoch까지 지켜볼지를 결정
+  patience_check = 0 # 현재 몇 epoch 연속으로 loss 개선이 안되는지를 기록
+  val = []
+  for epoch in range(nb_epochs):
+    model.train()
+    for x_train, y_train in train_dl:
+      loss_batch(model, loss_func, x_train, y_train, opt)
+      
+    scheduler.step()
+    
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+      for x_val, y_val in valid_dl:
+        losses, nums = loss_batch(model, loss_func, x_val, y_val)
+        val_loss += losses/nums
+    val.append(val_loss)
 
-  scheduler.step()
-
-  # 10번 epoch마다 평균 loss 출력
-  if epoch % 10 == 0:
-    print('Epoch {:4d}/{} Loss: {:.6f}'.format(
-        epoch, nb_epochs, sum_loss/len(dataloader)))
-
-  ### Validation loss Check
-  model.eval()
-  val_loss = 0
-  for x_val, y_val in val_dataloader:
-
-    x_val = x_val.to(device)
-    y_val = y_val.to(device)
-
-    val_pred = model(x_val)
-    loss = MSLE_loss(val_pred, y_val)
-
-    val_loss += loss.item()
-  val.append(val_loss)
-  ### early stopping 여부를 체크하는 부분 ###
-  if abs(val_loss - best_loss) < 1e-3: # loss가 개선되지 않은 경우
-  # if val_loss > best_loss :
+    print(epoch, val_loss)
+    if abs(val_loss - best_loss) < 1e-3: # loss가 개선되지 않은 경우
       patience_check += 1
 
       if patience_check >= patience_limit: # early stopping 조건 만족 시 조기 종료
           print("Learning End. Best_Loss:{:6f}".format(best_loss/len(val_dataloader)))
           break
 
-  else: # loss가 개선된 경우
+    else: # loss가 개선된 경우
       best_loss = val_loss
       best_model = copy.deepcopy(model)
       patience_check = 0
       
-#%%      
+  return val, copy.deepcopy(best_model)
+#%%   
+
+model, optimizer, scheduler = get_model([288,1024,1024,1])
+vali_loss, best_model = fit(model, MSLE_loss, optimizer, scheduler, dataloader, val_dataloader, 500)
+ 
 import matplotlib.pyplot as plt
-plt.plot(val[:])
-plt.plot(range(10,len(val)),val[10:])
-plt.hist(train_data['SalePrice'])
+plt.plot(vali_loss)
 
-plt.hist(train_target)
-
-# Model Test
-test_data_t = torch.tensor(test_data.values, dtype=torch.float32).to(device)
-prediction = best_model(test_data_t)
-
-# print(test_data)
-print(prediction)
-
-save = prediction.cpu()
-save = save.detach().numpy()
-pd.DataFrame(save).to_csv("result.csv")
-
-area = train_data['LotArea']
-plt.hist(area, range=(0,50000))
-
-street = train_data['RoofStyle']
-street.value_counts().plot(kind='bar')
-
-##########################################################
-#%%
-class Learning():
-  def __init__(self, dataloader, model, loss, optimizer):
-      self.dataloader = dataloader
-      self.model = model
-      self.loss = loss
-      self.optimizer = optimizer
-      
-  def train(self, valid=False):
-    sum_loss = 0
-    if valid :
-      model.eval()
-    else:
-      model.train()
-    for samples in enumerate(self.dataloader):
-      x_train, y_train = samples
-      x_train = x_train.to(device)
-      y_train = y_train.to(device)
-
-      # prediction 계산
-      prediction = self.model(x_train)
-
-      # loss 계산
-      loss = self.loss(prediction, y_train)
-      sum_loss += loss.item()
-      
-      if valid : continue
-      # parameter 조정
-      self.optimizer.zero_grad()
-      loss.backward()
-      self.optimizer.step()
-    
-    mean_loss = sum_loss/len(self.dataloader) 
-    print("mean Loss {:6f}".format(mean_loss))
-    return mean_loss
-  
-  
-train = Learning(dataloader, model, MSLE_loss, optimizer)  
-valid = Learning(val_dataloader, model, MSLE_loss, optimizer)    
-scheduler = optim.lr_scheduler.StepLR(train.optimizer, step_size=10, gamma=0.5)      
-#%%
-nb_epochs = 5
-for epoch in range(nb_epochs + 1):
-  train.train()
-  
-  scheduler.step()
-  
-  valid.train(True)
-
-# %%
